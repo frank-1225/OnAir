@@ -25,6 +25,8 @@ struct FaxStatus {
     int phasingLines = 0;               // phasing lines used to lock the line start
     int width = 0;                      // image width in pixels (0 until an image starts)
     uint64_t imageSeq = 0;              // the picture's change counter (latestImage): a new row, a slant change, a roll into place
+    uint64_t syncRecoveries = 0;        // confirmed discontinuities recovered within this picture
+    double lastSyncShiftPx = 0;         // last local line-start correction; previously received rows are unchanged
 };
 
 // Image width for an index of cooperation: IOC x pi, cut to a whole number as fldigi does (576 -> 1809, 288 -> 904).
@@ -44,7 +46,7 @@ public:
     void setIoc(int ioc);               // 576 or 288; 0 = from the start tone
     void setSlantPpm(double ppm);       // trim of the line period in ppm (positive = a line lasts longer in audio samples,
                                         // i.e. the audio clock runs fast); changes the rows already received too
-    void setAutoSlant(bool on);         // estimate the slant from the phasing lines (default on); the manual value is added to it
+    void setAutoSlant(bool on);         // estimate clock slant and recover line phase after gaps (default on); manual ppm is added
     void setMaxLines(int n);            // image height limit, default 1500; the image stops growing there
     void reset();
     void push(const float* audio, size_t n);

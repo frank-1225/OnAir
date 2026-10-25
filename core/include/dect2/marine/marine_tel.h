@@ -74,6 +74,8 @@ struct MarineFaxInfo {
     double snrDb = 0;
     uint64_t imageSeq = 0;           // changes when latestImage() has something new
     int thumbRows = 0;               // rows of the 256 px wide preview the viewer may show (lines / scale)
+    uint64_t syncRecoveries = 0;
+    double lastSyncShiftPx = 0;
 };
 
 struct MarineTelemetry {

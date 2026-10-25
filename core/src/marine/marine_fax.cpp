@@ -124,6 +124,103 @@ struct FaxDecoder::State {
     int refRows = 0;
     bool periodDirty = false;
 
+    // A missing transfer changes line PHASE, not the sample clock's rate. Keep a local time offset, so a recovery
+    // moves only the damaged/following rows, never shears the good part of a picture to hide a discontinuity.
+    double linePhase = 0;
+    std::vector<double> rowStarts;
+    static constexpr int kTrackN = 512;
+    std::vector<double> trackRef;
+    int trackRows = 0, trackPending = 0, trackMisses = 0;
+    double trackShift = 0;
+    int64_t refAfter = 0;
+
+    void resetTracker() {
+        trackRef.clear(); trackRows = trackPending = trackMisses = 0; trackShift = 0;
+    }
+
+    // Charts have persistent vertical structure. Require a strong, unambiguous circular-correlation peak on TWO
+    // successive rows before changing phase. Flat rows, noise and an ordinary changing map must not steer the clock.
+    // This is a fallback when the source did not supply the exact location/length of a lost transfer.
+    double trackLine(const std::vector<uint8_t>& row) {
+        if (!autoSlant.load() || imgW < 64) return 0;
+        std::vector<double> p(kTrackN), g(kTrackN), rg(kTrackN);
+        double mean = 0, var = 0;
+        for (int i = 0; i < kTrackN; i++) {
+            const int lo = i * imgW / kTrackN, hi = (i + 1) * imgW / kTrackN;
+            double v = 0; for (int x = lo; x < hi; x++) v += row[x];
+            p[i] = v / std::max(1, hi - lo); mean += p[i];
+        }
+        mean /= kTrackN;
+        for (double& v : p) { v -= mean; var += v * v; }
+        if (var < kTrackN * 100.0) { trackPending = 0; return 0; }
+        if (trackRef.empty()) { trackRef = p; trackRows = 1; return 0; }
+        double rv = 0, gv = 0, rgv = 0;
+        for (int i = 0; i < kTrackN; i++) {
+            g[i] = p[(i + 2) % kTrackN] - p[(i + kTrackN - 2) % kTrackN];
+            rg[i] = trackRef[(i + 2) % kTrackN] - trackRef[(i + kTrackN - 2) % kTrackN];
+            rv += trackRef[i] * trackRef[i]; gv += g[i] * g[i]; rgv += rg[i] * rg[i];
+        }
+        const double norm = std::sqrt(var * rv), gn = std::sqrt(gv * rgv);
+        if (norm < 1 || gn < 1) return 0;
+        std::vector<double> corr(kTrackN);
+        int best = 0;
+        for (int d = 0; d < kTrackN; d++) {
+            double a = 0, b = 0;
+            for (int i = 0; i < kTrackN; i++) { a += trackRef[i] * p[(i + d) % kTrackN]; b += rg[i] * g[(i + d) % kTrackN]; }
+            corr[d] = 0.7 * a / norm + 0.3 * b / gn;
+            if (corr[d] > corr[best]) best = d;
+        }
+        double other = -1;
+        for (int d = 0; d < kTrackN; d++) {
+            const int delta = std::abs(d - best);
+            if (std::min(delta, kTrackN - delta) > 12) other = std::max(other, corr[d]);
+        }
+        double shift = best > kTrackN / 2 ? best - kTrackN : best;
+        const double l = corr[(best + kTrackN - 1) % kTrackN], c = corr[best], h = corr[(best + 1) % kTrackN];
+        if (l - 2 * c + h < 0) shift += std::clamp(0.5 * (l - h) / (l - 2 * c + h), -0.5, 0.5);
+        bool jump = trackRows >= 3 && std::abs(shift) * imgW / kTrackN >= 8 &&
+                    c > 0.4 && c - corr[0] > 0.15 && c - other > 0.08;
+        if (jump) {
+            // A changing legend/grey wedge can dominate the whole-row correlation. A lost transfer displaces
+            // independent parts of the chart together; a region that still strongly matches at zero vetoes it.
+            auto regional = [&](int from, int lag) {
+                double sx = 0, sy = 0, xx = 0, yy = 0, xy = 0;
+                constexpr int len = kTrackN / 4;
+                for (int i = from; i < from + len; i++) {
+                    const double x = trackRef[i], y = p[(i + lag) % kTrackN];
+                    sx += x; sy += y; xx += x * x; yy += y * y; xy += x * y;
+                }
+                const double vx = xx - sx * sx / len, vy = yy - sy * sy / len;
+                return vx > len * 100 && vy > len * 100 ? (xy - sx * sy / len) / std::sqrt(vx * vy) : 0.0;
+            };
+            int agree = 0, oppose = 0;
+            for (int from = 0; from < kTrackN; from += kTrackN / 4) {
+                const double a = regional(from, best), z = regional(from, 0);
+                if (a > 0.55 && a - z > 0.15) agree++;
+                if (z > 0.65 && z - a > 0.1) oppose++;
+            }
+            jump = agree >= 2 && oppose == 0;
+        }
+        if (jump) {
+            if (trackPending && std::fabs(std::remainder(shift - trackShift, kTrackN)) < 3) trackPending++;
+            else trackPending = 1;
+            trackShift = shift;
+            trackMisses = 0;
+            if (trackPending >= 2) {
+                trackPending = 0;
+                // The parabolic peak supplies a fractional-bin correction in image pixels.
+                return shift * imgW / kTrackN;
+            }
+            return 0; // do not teach the template the damaged line
+        }
+        trackPending = 0;
+        if (corr[0] > 0.5 || trackRows < 3) {
+            for (int i = 0; i < kTrackN; i++) trackRef[i] += 0.2 * (p[i] - trackRef[i]);
+            trackRows++; trackMisses = 0;
+        } else if (++trackMisses > 24) resetTracker(); // changed scene: wait for a new reliable reference
+        return 0;
+    }
+
     State() { configure(12000); }
 
     // ---- setup ----
@@ -223,6 +320,7 @@ struct FaxDecoder::State {
         freeRun = false;
         refRows = 0;
         periodDirty = false;
+        linePhase = 0; rowStarts.clear(); refAfter = 0; resetTracker();
         const int ioc = iocSet.load() > 0 ? iocSet.load() : 576;
         st = FaxStatus();
         st.ioc = ioc;
@@ -514,7 +612,7 @@ struct FaxDecoder::State {
 
     // ---- state machine events ----
     void onStartTone(int kind, int64_t onset, double dMeasured) {
-        if (st.state == 2) truncateRows(onset);
+        if (st.state == 2) { imageLines(true); truncateRows(onset); }
         st.state = 1;
         locked = false;
         freeFrom = nAud;
@@ -538,7 +636,7 @@ struct FaxDecoder::State {
     }
 
     void onStopTone(int64_t onset) {
-        if (st.state == 2) truncateRows(onset);
+        if (st.state == 2) { imageLines(true); truncateRows(onset); }
         st.state = 3;
         locked = false;
         chain.clear();
@@ -554,7 +652,7 @@ struct FaxDecoder::State {
         int keep = rowIdx;
         const int from = std::max(0, rowIdx - 6);
         for (int r = from; r < rowIdx; r++) {
-            const double s = imgStart + r * Puse;
+            const double s = rowStarts[static_cast<size_t>(r)];
             int low = 0;
             for (int k = 0; k < 20; k++) {
                 const double a = s + k * Puse / 20.0;
@@ -568,6 +666,7 @@ struct FaxDecoder::State {
             pubImage.height = keep;
             imgSeq++;
             rowIdx = keep;
+            rowStarts.resize(static_cast<size_t>(keep));
         }
         st.lines = rowIdx;
     }
@@ -657,6 +756,8 @@ struct FaxDecoder::State {
         }
         rowIdx = 0;
         freeRun = false;
+        linePhase = 0; rowStarts.clear(); refAfter = 0; resetTracker();
+        st.syncRecoveries = 0; st.lastSyncShiftPx = 0;
         st.state = 2;
         st.lines = 0;
         st.slantPpm = (Puse / Pnom - 1.0) * 1e6;
@@ -675,6 +776,7 @@ struct FaxDecoder::State {
     void applyManual() {
         const double m = manualPpm.load();
         if (std::fabs(m - appliedManual) < 1e-9 && !periodDirty) return;
+        if (std::fabs(m - appliedManual) >= 1e-9) resetTracker();
         appliedManual = m;
         periodDirty = false;
         double ppm = (autoSlant.load() ? estPpm : 0.0) + m;
@@ -687,6 +789,7 @@ struct FaxDecoder::State {
         std::lock_guard<std::mutex> lk(pubMtx);
         std::vector<uint8_t> tmp(imgW);
         for (int r = 1; r < rowIdx; r++) {
+            rowStarts[static_cast<size_t>(r)] += r * dP;
             uint8_t* row = &pubImage.pix[static_cast<size_t>(r) * imgW];
             const double sh = r * dP / spp;
             for (int j = 0; j < imgW; j++) {
@@ -702,26 +805,41 @@ struct FaxDecoder::State {
         imgSeq++;
     }
 
-    void imageLines() {
+    void imageLines(bool flush = false) {
         applyManual();
         const int W = imgW;
         const int cap = maxLines.load();
         std::vector<uint8_t> row(W);
         bool any = false;
-        while (static_cast<double>(nAud) >= imgStart + (rowIdx + 1) * Puse + 4) {
+        // Half a line of look-ahead lets a positive phase correction be rendered from real samples immediately.
+        while (static_cast<double>(nAud) >= imgStart + (rowIdx + (flush ? 1.0 : 1.5)) * Puse + linePhase + 4) {
             if (rowIdx >= cap) { st.state = 3; break; }
-            const double s = imgStart + rowIdx * Puse;
+            double s = imgStart + rowIdx * Puse + linePhase;
             const double spp = Puse / W;
-            // the picture: through the narrow filter while the signal is weak (or not measured), the wide one when it is strong
-            const std::vector<double>& cp = snrAvg >= kWideSnrDb ? cumW : cum;
-            double prev = integ(cp, s);
             const double span = fwUse - fbUse;
-            for (int j = 0; j < W; j++) {
-                const double nxt = integ(cp, s + (j + 1) * spp);
-                const double f = (nxt - prev) / spp;
-                prev = nxt;
-                const double v = (f - fbUse) / span;
-                row[j] = static_cast<uint8_t>(std::lround(255.0 * std::min(1.0, std::max(0.0, v))));
+            auto render = [&] {
+                // the picture: through the narrow filter while the signal is weak (or not measured), the wide one when it is strong
+                const std::vector<double>& cp = snrAvg >= kWideSnrDb ? cumW : cum;
+                double prev = integ(cp, s);
+                for (int j = 0; j < W; j++) {
+                    const double nxt = integ(cp, s + (j + 1) * spp);
+                    const double f = (nxt - prev) / spp;
+                    prev = nxt;
+                    const double v = (f - fbUse) / span;
+                    row[j] = static_cast<uint8_t>(std::lround(255.0 * std::min(1.0, std::max(0.0, v))));
+                }
+            };
+            render();
+            const double shift = flush ? 0 : trackLine(row);
+            if (shift != 0) {
+                const double delta = shift * spp;
+                if (s + delta >= base && s + delta + Puse + 4 <= nAud) {
+                    linePhase += delta; s += delta;
+                    st.syncRecoveries++; st.lastSyncShiftPx = shift;
+                    refRows = 0; std::fill(std::begin(refAcc), std::end(refAcc), 0.0);
+                    refAfter = static_cast<int64_t>(s + (kRefK + 1) * Puse);
+                    render();
+                }
             }
             {
                 std::lock_guard<std::mutex> lk(pubMtx);
@@ -730,6 +848,7 @@ struct FaxDecoder::State {
                 imgSeq++;
             }
             rowIdx++;
+            rowStarts.push_back(s);
             any = true;
             if (freeRun) refineRow(s);
         }
@@ -841,6 +960,8 @@ struct FaxDecoder::State {
         st.phasingLines = 0;
         st.slantPpm = estPpm + m;
         freeRun = true;
+        linePhase = 0; rowStarts.clear(); refAfter = 0; resetTracker();
+        st.syncRecoveries = 0; st.lastSyncShiftPx = 0;
         refLag = static_cast<int64_t>(std::lround(kRefK * P0));
         std::fill(std::begin(refAcc), std::end(refAcc), 0.0);
         refRows = 0;
@@ -896,12 +1017,14 @@ struct FaxDecoder::State {
             imgSeq++;
         }
         imgStart += bc * (Puse / W);
+        for (double& t : rowStarts) t += bc * (Puse / W);
+        resetTracker();
     }
 
     // Free-running picture: correlate the row just decoded with the one kRefK rows above; the lag of the peak, summed over every
     // row so far, is kRefK line periods. The picture is straightened with each new estimate (the rows already received too).
     void refineRow(double s) {
-        if (!autoSlant.load()) return;
+        if (!autoSlant.load() || s < refAfter) return;
         const int64_t s0 = static_cast<int64_t>(std::floor(s));
         const int64_t len = static_cast<int64_t>(Pnom);
         if (s0 - refLag - kRefR < base || s0 + len + smD > nAud) return;
@@ -913,7 +1036,7 @@ struct FaxDecoder::State {
             refAcc[d + kRefR] += acc;
         }
         ++refRows;
-        if (refRows == 24 || refRows == 96) alignLines();
+        if (st.syncRecoveries == 0 && (refRows == 24 || refRows == 96)) alignLines();
         if (refRows % 4 != 0) return;
         int bi = -kRefR;
         for (int d = -kRefR; d <= kRefR; d++) if (refAcc[d + kRefR] > refAcc[bi + kRefR]) bi = d;

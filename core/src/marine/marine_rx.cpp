@@ -268,6 +268,8 @@ void MarineReceiver::Impl::publish() {
     // the decoder's change counter: new rows, and also a slant change or a roll of the rows already received (the line count was
     // used before, so a picture straightened by the slider, or after it had stopped, never reached the viewer)
     tel.fax.imageSeq = fs.imageSeq;
+    tel.fax.syncRecoveries = fs.syncRecoveries;
+    tel.fax.lastSyncShiftPx = fs.lastSyncShiftPx;
 }
 
 MarineReceiver::MarineReceiver() : p_(std::make_unique<Impl>()) {}

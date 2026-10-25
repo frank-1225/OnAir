@@ -561,7 +561,7 @@ void faxView(App& a) {
     if (ImGui::Combo("##mfioc", &S.iocIdx, iocN, 3)) plat::prefs().setI("marineIoc", S.iocIdx);
     flowNext();
     if (ImGui::Checkbox("auto slant", &S.autoSlant)) plat::prefs().setB("marineAutoSlant", S.autoSlant);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Measure the sample clock error from the phasing lines and straighten the picture.\nThe slider is added on top.");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Measure the sample clock error and straighten the picture.\nContinuously check line phase; recover after missing samples when independent parts of successive rows agree.\nThe slider is added on top.");
     flowNext(); ImGui::SetNextItemWidth(150 * gUi);
     if (ImGui::SliderFloat("##mfsl", &S.slant, -300.f, 300.f, "slant %+.1f ppm")) plat::prefs().setD("marineSlant", S.slant);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Straighten a slanted picture by hand. Applies to the lines already received too. Double-click to type.");
@@ -585,6 +585,8 @@ void faxView(App& a) {
     { ImGui::PushTextWrapPos(0); ImGui::TextDisabled("%s, IOC %d, %d lpm, %d lines, %d px wide, slant %+.1f ppm, black at %.0f Hz (%+.0f Hz off), last tone %.0f Hz",
                         st[std::max(0, std::min(3, f.state))], f.ioc, f.lpm, f.lines, f.width, f.slantPpm, f.blackHz, f.blackHz - 1500.0, f.toneHz); ImGui::PopTextWrapPos(); }
     if (!S.saveMsg.empty()) { ImGui::SameLine(); ImGui::TextDisabled("  %s", S.saveMsg.c_str()); }
+    if (f.syncRecoveries) ImGui::TextDisabled("line sync recovered %llu times, last correction %+.1f px",
+                                             (unsigned long long)f.syncRecoveries, f.lastSyncShiftPx);
 
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
     const ImVec2 box = ImGui::GetContentRegionAvail();
